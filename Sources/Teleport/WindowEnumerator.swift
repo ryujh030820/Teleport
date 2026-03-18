@@ -1,6 +1,7 @@
 import AppKit
 import CoreGraphics
 import Darwin
+@preconcurrency import ScreenCaptureKit
 
 struct SwitchableWindow: Identifiable, @unchecked Sendable {
     let windowID: CGWindowID?
@@ -85,13 +86,21 @@ enum WindowEnumerator {
         }
 
         // If AX missed some windows, append the remaining CG windows so the list is still usable.
+        var shareableWindowsByID: [CGWindowID: SCWindow]?
         for cgWindow in cgWindows where !usedCGIDs.contains(cgWindow.id) {
             guard shouldIncludeFallbackCGWindow(cgWindow, appName: app.localizedName, existingAXWindows: axWindows) else {
                 continue
             }
 
             // Validate fallback-only windows with an actual capture so helper/empty windows do not pollute the list.
-            let fallbackThumbnail = captureThumbnail(windowID: cgWindow.id)
+            let fallbackThumbnail = captureThumbnail(
+                windowID: cgWindow.id,
+                shareableWindowsByID: shareableWindowsByID ?? {
+                    let loaded = loadShareableWindowsByID()
+                    shareableWindowsByID = loaded
+                    return loaded
+                }()
+            )
             guard fallbackThumbnail != nil else {
                 continue
             }
@@ -113,10 +122,12 @@ enum WindowEnumerator {
 
     /// Capture thumbnails for already-enumerated windows (can be slow).
     static func withThumbnails(_ windows: [SwitchableWindow]) -> [SwitchableWindow] {
-        windows.map { window in
+        let shareableWindowsByID = loadShareableWindowsByID()
+
+        return windows.map { window in
             guard let windowID = window.windowID else { return window }
             var copy = window
-            copy.thumbnail = captureThumbnail(windowID: windowID)
+            copy.thumbnail = captureThumbnail(windowID: windowID, shareableWindowsByID: shareableWindowsByID)
             return copy
         }
     }
@@ -227,10 +238,7 @@ enum WindowEnumerator {
         }
 
         // No fullscreen flag — keep only the largest window (likely the real one).
-        if let largest = windows.max(by: {
-            ($0.bounds?.width ?? 0) * ($0.bounds?.height ?? 0) <
-            ($1.bounds?.width ?? 0) * ($1.bounds?.height ?? 0)
-        }) {
+        if let largest = windows.max(by: { windowArea($0.bounds) < windowArea($1.bounds) }) {
             // Only deduplicate if windows share the same fallback title (app name).
             let allSameTitle = windows.allSatisfy { $0.title == windows.first?.title }
             if allSameTitle {
@@ -304,6 +312,11 @@ enum WindowEnumerator {
         abs(ax.origin.y - cg.origin.y) < 2 &&
         abs(ax.width - cg.width) < 2 &&
         abs(ax.height - cg.height) < 2
+    }
+
+    private static func windowArea(_ bounds: CGRect?) -> CGFloat {
+        guard let bounds else { return 0 }
+        return bounds.width * bounds.height
     }
 
     private static func shouldIncludeFallbackCGWindow(
@@ -404,18 +417,63 @@ enum WindowEnumerator {
 
     // MARK: - Thumbnail
 
+    private final class ResultBox<T>: @unchecked Sendable {
+        var value: T
+
+        init(_ value: T) {
+            self.value = value
+        }
+    }
+
     private static func captureThumbnail(windowID: CGWindowID) -> NSImage? {
-        guard let cgImage = CGWindowListCreateImage(
-            .null,
-            .optionIncludingWindow,
-            windowID,
-            [.boundsIgnoreFraming, .bestResolution]
-        ) else {
+        captureThumbnail(windowID: windowID, shareableWindowsByID: loadShareableWindowsByID())
+    }
+
+    private static func captureThumbnail(
+        windowID: CGWindowID,
+        shareableWindowsByID: [CGWindowID: SCWindow]
+    ) -> NSImage? {
+        guard let window = shareableWindowsByID[windowID] else {
             return nil
         }
 
+        let filter = SCContentFilter(desktopIndependentWindow: window)
+        let configuration = SCStreamConfiguration()
+        configuration.width = max(size_t(window.frame.width.rounded(.up)), 1)
+        configuration.height = max(size_t(window.frame.height.rounded(.up)), 1)
+        configuration.showsCursor = false
+        configuration.scalesToFit = false
+        configuration.ignoreShadowsSingleWindow = true
+
+        let semaphore = DispatchSemaphore(value: 0)
+        let imageBox = ResultBox<CGImage?>(nil)
+        SCScreenshotManager.captureImage(contentFilter: filter, configuration: configuration) { image, _ in
+            imageBox.value = image
+            semaphore.signal()
+        }
+        semaphore.wait()
+
+        let cgImage = imageBox.value
+        guard let cgImage else { return nil }
         guard cgImage.width > 1 && cgImage.height > 1 else { return nil }
 
         return NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
+    }
+
+    private static func loadShareableWindowsByID() -> [CGWindowID: SCWindow] {
+        let semaphore = DispatchSemaphore(value: 0)
+        let windowsBox = ResultBox<[CGWindowID: SCWindow]>([:])
+
+        SCShareableContent.getExcludingDesktopWindows(true, onScreenWindowsOnly: false) {
+            content,
+            _ in
+            if let content {
+                windowsBox.value = Dictionary(uniqueKeysWithValues: content.windows.map { ($0.windowID, $0) })
+            }
+            semaphore.signal()
+        }
+
+        semaphore.wait()
+        return windowsBox.value
     }
 }

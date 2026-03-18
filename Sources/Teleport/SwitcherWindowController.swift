@@ -589,17 +589,22 @@ final class SwitcherWindowController: NSWindowController, NSWindowDelegate {
     private func activate(app: SwitchableApp) {
         hide()
         onActivateApplication?(app.runningApplication)
-        app.runningApplication.activate(options: [.activateIgnoringOtherApps])
+        activateRunningApplication(app.runningApplication)
     }
 
     private func activateWindow(_ window: SwitchableWindow, for app: SwitchableApp) {
         hide()
         onActivateApplication?(app.runningApplication)
-        app.runningApplication.activate(options: [.activateIgnoringOtherApps])
+        activateRunningApplication(app.runningApplication)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.03) {
             WindowEnumerator.focusWindow(window, in: app.runningApplication)
-            app.runningApplication.activate(options: [.activateIgnoringOtherApps])
+            self.activateRunningApplication(app.runningApplication)
         }
+    }
+
+    private func activateRunningApplication(_ application: NSRunningApplication) {
+        NSApp.yieldActivation(to: application)
+        _ = application.activate(from: NSRunningApplication.current, options: [])
     }
 
     private func hide() {
